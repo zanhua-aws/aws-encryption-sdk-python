@@ -16,6 +16,8 @@ import functools
 import itertools
 import logging
 
+import os
+
 import attr
 import boto3
 import botocore.client
@@ -23,6 +25,7 @@ import botocore.config
 import botocore.session
 import six
 from botocore.exceptions import ClientError
+from cryptography.hazmat.primitives import serialization
 
 from aws_encryption_sdk.exceptions import (
     ConfigMismatchError,
@@ -30,7 +33,9 @@ from aws_encryption_sdk.exceptions import (
     EncryptKeyError,
     GenerateKeyError,
     MalformedArnError,
+    MasterKeyError,
     MasterKeyProviderError,
+    NotSupportedError,
     UnknownRegionError,
 )
 from aws_encryption_sdk.identifiers import USER_AGENT_SUFFIX
@@ -38,6 +43,9 @@ from aws_encryption_sdk.internal.arn import arn_from_str, is_valid_mrk_identifie
 from aws_encryption_sdk.internal.str_ops import to_str
 from aws_encryption_sdk.key_providers.base import MasterKey, MasterKeyConfig, MasterKeyProvider, MasterKeyProviderConfig
 from aws_encryption_sdk.structures import DataKey, EncryptedDataKey, MasterKeyInfo
+from aws_encryption_sdk.internal.crypto.wrapping_keys import WrappingKey
+from aws_encryption_sdk.identifiers import EncryptionKeyType, WrappingAlgorithm
+
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -156,6 +164,9 @@ class KMSMasterKeyConfig(MasterKeyConfig):
     client = attr.ib(hash=True, validator=attr.validators.instance_of(botocore.client.BaseClient))
     grant_tokens = attr.ib(
         hash=True, default=attr.Factory(tuple), validator=attr.validators.instance_of(tuple), converter=tuple
+    )
+    key_path = attr.ib(
+        hash=True, default=None, validator=attr.validators.optional(attr.validators.instance_of(str))
     )
 
     @client.default
@@ -548,6 +559,9 @@ class KMSMasterKeyProviderConfig(MasterKeyProviderConfig):
     discovery_region = attr.ib(
         hash=True, default=None, validator=attr.validators.optional(attr.validators.instance_of(six.string_types))
     )
+    key_paths = attr.ib(
+        hash=True, default=attr.Factory(dict), validator=attr.validators.instance_of(dict), converter=dict
+    )
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -731,6 +745,16 @@ class BaseKMSMasterKeyProvider(MasterKeyProvider):
         itself.
         """
         _key_id = to_str(key_id)  # KMS client requires str, not bytes
+
+        if issubclass(self.master_key_config_class, KMSMasterKeyConfig):
+            key_path = None
+            if _key_id in self.config.key_paths:
+                key_path = self.config.key_paths[_key_id]
+            return self.master_key_class(
+                config=self.master_key_config_class(
+                    key_id=key_id, client=self._client(_key_id), grant_tokens=self.config.grant_tokens, key_path=key_path
+                )
+            )
 
         return self.master_key_class(
             config=self.master_key_config_class(
@@ -1011,3 +1035,158 @@ class MRKAwareDiscoveryAwsKmsMasterKeyProvider(DiscoveryAwsKmsMasterKeyProvider)
                     key_id=new_key_id, client=self._client(new_key_id), grant_tokens=self.config.grant_tokens
                 )
             )
+
+class KMSAsymmetricKey(KMSMasterKey):
+    target_key_specs = ["RSA_2048", "RSA_3072" ,"RSA_4096"]
+    target_key_usages = ["ENCRYPT_DECRYPT"]
+    target_algorithm = "RSAES_OAEP_SHA_256"
+    provider_id = _PROVIDER_ID
+
+    def _generate_data_key(self, algorithm, encryption_context=None):
+        plaintext_data_key = os.urandom(algorithm.kdf_input_len)
+
+        encrypted_data_key = self._encrypt_data_key(
+            plaintext_data_key=plaintext_data_key,
+            algorithm=algorithm,
+            encryption_context=encryption_context,
+        )
+        return DataKey(
+            key_provider=encrypted_data_key.key_provider,
+            data_key=plaintext_data_key,
+            encrypted_data_key=encrypted_data_key.encrypted_data_key,
+        )
+
+    def _encrypt_data_key(self, plaintext_data_key, algorithm, encryption_context=None):
+        """Encrypts a data key and returns the ciphertext.
+
+        :param data_key: Unencrypted data key
+        :type data_key: :class:`aws_encryption_sdk.structures.RawDataKey`
+            or :class:`aws_encryption_sdk.structures.DataKey`
+        :param algorithm: Placeholder to maintain API compatibility with parent
+        :param dict encryption_context: Encryption context to pass to KMS
+        :returns: Data key containing encrypted data key
+        :rtype: aws_encryption_sdk.structures.EncryptedDataKey
+        :raises EncryptKeyError: if Master Key is unable to encrypt data key
+        """
+        pem_key, key_id = self._get_public_key()
+        wrapping_key = WrappingKey(
+            wrapping_algorithm=WrappingAlgorithm.RSA_OAEP_SHA256_MGF1,
+            wrapping_key=pem_key,
+            wrapping_key_type=EncryptionKeyType.PUBLIC
+        )
+
+        encrypted_data_key = wrapping_key.encrypt(
+            plaintext_data_key=plaintext_data_key, encryption_context=encryption_context
+        )
+
+        return DataKey(
+            key_provider=MasterKeyInfo(provider_id=self.provider_id, key_info=key_id),
+            data_key=plaintext_data_key,
+            encrypted_data_key=encrypted_data_key.ciphertext,
+        )
+
+    def _get_public_key(self):
+        raw_public_key, key_id = self._get_raw_public_key()
+
+        der_key = serialization.load_der_public_key(raw_public_key)
+        pem_key = der_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.PKCS1
+        )
+        return pem_key, key_id
+
+    def _get_raw_public_key(self):
+        if self.config.key_path is None:
+            return self._download_raw_public_key()
+
+        # open the file
+        with open(self.config.key_path, "rb") as file:
+            raw_public_key = file.read()
+
+        return raw_public_key, self._key_id
+
+    def _download_raw_public_key(self):
+        kms_params = self._build_get_public_key_request()
+        # Catch any boto3 errors and normalize to expected EncryptKeyError
+        try:
+            response = self.config.client.get_public_key(**kms_params)
+            raw_public_key = response["PublicKey"]
+            key_id = response["KeyId"]
+            key_spec = response["KeySpec"]
+            key_usage = response["KeyUsage"]
+            encrypt_algorithms = response["EncryptionAlgorithms"]
+        except (ClientError, KeyError):
+            error_message = "Unable to download public key from {}".format(key_id=self._key_id)
+            _LOGGER.exception(error_message)
+            raise MasterKeyError(error_message)
+
+        try:
+            key_id_str = to_str(key_id)
+            arn_from_str(key_id_str)
+        except MalformedArnError:
+            error_message = "Retrieved an unexpected KeyID in response from KMS: {key_id}".format(key_id=key_id)
+            _LOGGER.exception(error_message)
+            raise MasterKeyError(error_message)
+
+        # More error check
+        if key_spec not in KMSAsymmetricKey.target_key_specs:
+            error_message = "Key spec {key_spec} of {key_id} is not supported".format(key_spec=key_spec, key_id=key_id)
+            _LOGGER.exception(error_message)
+            raise MasterKeyError(error_message)
+        if key_usage not in KMSAsymmetricKey.target_key_usages:
+            error_message = "Key usage {key_usage} of {key_id} is not supported".format(key_usage=key_usage, key_id=key_id)
+            _LOGGER.exception(error_message)
+            raise MasterKeyError(error_message)
+        if KMSAsymmetricKey.target_algorithm not in encrypt_algorithms:
+            error_message = "Algorithm {algorithm} not supported by {key_id}".format(algorithm=KMSAsymmetricKey.target_algorithm, key_id=key_id)
+            _LOGGER.exception(error_message)
+            raise MasterKeyError(error_message)
+
+        return raw_public_key, self._key_id
+
+    def _build_get_public_key_request(self):
+        kms_params = {"KeyId": self._key_id}
+        if self.config.grant_tokens:
+            kms_params["GrantTokens"] = self.config.grant_tokens
+        return kms_params
+
+    def _build_decrypt_request(self, encrypted_data_key, encryption_context):
+        kms_params = {"CiphertextBlob": encrypted_data_key.encrypted_data_key, "KeyId": self._key_id}
+        kms_params["EncryptionAlgorithm"] = "RSAES_OAEP_SHA_256"
+        if self.config.grant_tokens:
+            kms_params["GrantTokens"] = self.config.grant_tokens
+        return kms_params
+
+
+class KMSAsymmetricKeyProvider(BaseKMSMasterKeyProvider):
+    master_key_class = KMSAsymmetricKey
+    provider_id = _PROVIDER_ID
+    def __init__(self, **kwargs):
+        """Sets configuration required by this provider type."""
+        super(KMSAsymmetricKeyProvider, self).__init__(**kwargs)
+        self.vend_masterkey_on_decrypt = False
+
+    def validate_config(self):
+        """Validates the provided configuration."""
+        if not self.config.key_ids:
+            # //= compliance/framework/aws-kms/aws-kms-mrk-aware-master-key-provider.txt#2.6
+            # //# The key id list MUST NOT be empty or null in strict mode.
+            raise ConfigMismatchError("To use KMSAsymmetricKeyProvider you must provide key ids")
+
+        if len(self.config.key_ids) > 1:
+            raise ConfigMismatchError("Currently KMSAsymmetricKeyProvider only support using 1 key")
+
+        if not self.config.key_ids[0]:
+            # //= compliance/framework/aws-kms/aws-kms-mrk-aware-master-key-provider.txt#2.6
+            # //# The key id list MUST NOT contain any null or empty string values.
+            raise ConfigMismatchError("Key ids must be valid AWS KMS ARNs")
+
+        if self.config.discovery_filter:
+            # //= compliance/framework/aws-kms/aws-kms-mrk-aware-master-key-provider.txt#2.6
+            # //# A discovery filter MUST NOT be configured in strict mode.
+            raise NotSupportedError("Discovery mode is not supported by KMSAsymmetricKeyProvider")
+
+        if self.config.discovery_region:
+            # //= compliance/framework/aws-kms/aws-kms-mrk-aware-master-key-provider.txt#2.6
+            # //# A default MRK Region MUST NOT be configured in strict mode.
+            raise NotSupportedError("TDiscovery mode is not supported by KMSAsymmetricKeyProvide")
